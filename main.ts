@@ -1,14 +1,41 @@
-// A working token-radar-01 entry (Node 22, standard library only).
+// Token Launch Radar — the token-radar-01 entry's build program (Node 22, standard library only).
 //
-// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
-// pre-token protocol with the model in lib/model.ts, writes the ranked board to /output/board.json, and
-// copies this repository's dashboard/ and screenshots/ to /output. Last, it writes /output/dossier.json,
-// the summary the judge reads, with the vendored make.fun library.
+// Pipeline, end to end:
+//   sealed snapshot (/input/snapshot.json, or --input <file|dir>)
+//     -> parseSnapshot + buildRadar in lib/model.ts (model `radar-2`)
+//     -> two independent gate checks on the finished board (below)
+//     -> /output/board.json, /output/data.js
+//     -> this repository's dashboard/ and screenshots/ copied to /output
+//     -> /output/dossier.json, the summary the judge reads, built with the
+//        vendored make.fun library (vendor/makefun-board.ts, never edited).
 //
-// The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
-// and dashboard/app.js read /output/data.js, which this program writes from the same board. A starting
-// point, not a winner: it covers the watchlist, states the model and gives every protocol a farm plan.
-// Change the model, the page or the plan; keep the gate's shape.
+// How the model prices a protocol (the assumptions the board stands on):
+//   - Only pre-token protocols are ranked: no market cap, no Gecko id, no
+//     symbol, and not a wrapped, staked or bridged product of a token that
+//     already trades. The snapshot's watchlist is the floor, never the
+//     ceiling: the board also ranks pre-token protocols above the floor that
+//     the watchlist leaves out, flagged on_watchlist: false.
+//   - Implied value comes from comparables, not from TVL alone: for each
+//     protocol, the median market-cap/TVL of live-token protocols in the same
+//     category (at least 3 comps, else the global median 0.246x), clamped to
+//     [0.05, 1.50]. Market cap is used as a conservative proxy for FDV, since
+//     FDV is usually >= market cap; that is stated on the dashboard, not hidden.
+//   - Three multipliers adjust the multiple: growth from the 7-day TVL change,
+//     tenure from the days since listing without a token, and reach from the
+//     number of chains. Implied FDV = TVL x multiple x growth x tenure x reach.
+//   - The airdrop pool is 7.5% of implied FDV, an explicit assumption the
+//     dashboard's scenario simulator lets a reader change.
+//   - Every row also carries a farmability score (cost, time, risk), an early
+//     score with its signals in plain words, and a 7-step farm plan whose
+//     steps each name their cost and time.
+//
+// Why this file checks the board twice: lib/model.ts already refuses a bad
+// board through boardIssue, and this file runs a second, independent check
+// (selfCheckBoard, below) written from the gate's limits directly. The two
+// agree on a good board and either one alone stops a bad one from being
+// written, so a bug in the model cannot ship a board the scorer refuses.
+// Neither check changes a row: a failed check exits before any file is
+// written, and a passing check leaves the output byte-identical.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -16,7 +43,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, dataScript, parseSnapshot, type BoardRow, type Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -25,6 +52,74 @@ const here = fileURLToPath(new URL('.', import.meta.url));
 const TEXT_MAX_BYTES = 65_536;
 const SCREENSHOT_CAPS = { max: 4, max_bytes: 524_288 };
 const IMAGE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+
+/** The gate's board limits, restated here so this file can judge a board on its own. */
+const GATE = {
+  board_min_rows: 100,
+  board_max_rows: 4000,
+  farm_steps_min: 3,
+  farm_steps_max: 12,
+  farm_step_min_chars: 20,
+  farm_step_max_chars: 600,
+  implied_max_usd: 100_000_000_000_000,
+} as const;
+
+/**
+ * A second, independent read of the finished board, written from the gate's
+ * limits rather than from the model's own checks: it re-derives every
+ * invariant from the rows themselves — row count, rank order, unique slugs,
+ * non-increasing implied value, exact watchlist coverage, farm-step count and
+ * length, implied value within its cap, and an airdrop pool that is positive
+ * and no larger than the implied value it comes from. Returns the first
+ * failure as plain words, or null when the board is safe to write. It runs
+ * after buildRadar and before any file is written, and it never changes a row.
+ */
+function selfCheckBoard(board: BoardRow[], snapshot: Snapshot): string | null {
+  if (board.length < GATE.board_min_rows || board.length > GATE.board_max_rows) {
+    return `board has ${board.length} rows: the gate takes ${GATE.board_min_rows} to ${GATE.board_max_rows}`;
+  }
+  const seen = new Set<string>();
+  let watchlistSeen = 0;
+  let previous = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < board.length; i++) {
+    const row = board[i]!;
+    if (row.rank !== i + 1) {
+      return `row ${i + 1} carries rank ${row.rank}: ranks must run 1..${board.length} in board order`;
+    }
+    if (seen.has(row.slug)) return `${row.slug} appears twice on the board`;
+    seen.add(row.slug);
+    if (row.on_watchlist) watchlistSeen++;
+    if (row.implied_value_usd > previous) {
+      return `${row.slug} at rank ${row.rank} outranks the row above it on implied value`;
+    }
+    previous = row.implied_value_usd;
+    if (!Number.isSafeInteger(row.implied_value_usd) || row.implied_value_usd <= 0) {
+      return `${row.slug} has implied value ${row.implied_value_usd}: it must be a positive whole number of dollars`;
+    }
+    if (row.implied_value_usd > GATE.implied_max_usd) {
+      return `${row.slug} has implied value $${row.implied_value_usd}: over the $${GATE.implied_max_usd} cap`;
+    }
+    if (!Number.isSafeInteger(row.airdrop_pool_usd) || row.airdrop_pool_usd <= 0 || row.airdrop_pool_usd > row.implied_value_usd) {
+      return `${row.slug} has airdrop pool $${row.airdrop_pool_usd}: it must be positive and no larger than the implied value`;
+    }
+    if (row.farm_steps.length < GATE.farm_steps_min || row.farm_steps.length > GATE.farm_steps_max) {
+      return `${row.slug} has ${row.farm_steps.length} farm steps: the gate takes ${GATE.farm_steps_min} to ${GATE.farm_steps_max}`;
+    }
+    for (const step of row.farm_steps) {
+      if (step.length < GATE.farm_step_min_chars || step.length > GATE.farm_step_max_chars) {
+        return `${row.slug} has a farm step of ${step.length} characters: the gate takes ${GATE.farm_step_min_chars} to ${GATE.farm_step_max_chars}`;
+      }
+    }
+  }
+  const missing = snapshot.watchlist.filter((slug) => !seen.has(slug));
+  if (missing.length > 0) {
+    return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`;
+  }
+  if (watchlistSeen !== snapshot.watchlist.length) {
+    return `the board flags ${watchlistSeen} rows as watchlist, but the snapshot names ${snapshot.watchlist.length}`;
+  }
+  return null;
+}
 
 /** --name <value> out of the arguments, or the fallback. */
 function arg(name: string, fallback: string): string {
@@ -47,6 +142,13 @@ const { board, radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
+  process.exit(1);
+}
+// The model's own check above is one read; this file's own check is a second
+// one, from the gate's limits directly, before anything is written.
+const selfIssue = selfCheckBoard(board, snapshot);
+if (selfIssue !== null) {
+  process.stderr.write(`token radar: the board fails this program's own gate check: ${selfIssue}\n`);
   process.exit(1);
 }
 
